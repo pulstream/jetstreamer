@@ -1,3 +1,7 @@
 [alias]
 clickhouse-server = "run --release -p jetstreamer-utils --bin clickhouse-server"
 clickhouse-client = "run --release -p jetstreamer-utils --bin clickhouse-client"
+
+[env]
+DYLD_LIBRARY_PATH = "/Library/Developer/CommandLineTools/usr/lib"
+LIBCLANG_PATH = "/Library/Developer/CommandLineTools/usr/lib"
