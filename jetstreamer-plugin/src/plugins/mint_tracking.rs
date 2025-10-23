@@ -87,7 +87,7 @@ impl Plugin for MintTrackingPlugin {
                         match decoded.data {
                             PumpfunInstruction::TradeEvent(trade_event) => {
                                 info!(
-                                    "🎯 TARGET MINT - Signature: {}, Slot: {}, Decoded Pumpfun Trade Event - Mint: {}, User: {}, Amount In: {}, Amount Out: {}, Is Buy: {}, Timestamp: {}",
+                                    "Signature: {}, Slot: {}, Trade Event - Mint: {}, Payer: {}, Amount In: {}, Amount Out: {}, Is Buy: {}, Timestamp: {}",
                                     transaction.signature,
                                     transaction.slot,
                                     trade_event.mint,

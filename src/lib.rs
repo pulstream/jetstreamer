@@ -115,6 +115,7 @@
 pub use jetstreamer_firehose as firehose;
 pub use jetstreamer_plugin as plugin;
 pub use jetstreamer_utils as utils;
+use solana_pubkey::Pubkey;
 
 use core::ops::Range;
 use jetstreamer_firehose::{epochs::slot_to_epoch, index::get_index_base_url};
@@ -308,6 +309,7 @@ impl Default for JetstreamerRunner {
                 slot_range: 0..0,
                 clickhouse_enabled: clickhouse_settings.enabled,
                 spawn_clickhouse: clickhouse_settings.spawn_helper && clickhouse_settings.enabled,
+                mint: None,
             },
         }
     }
@@ -498,6 +500,8 @@ pub struct Config {
     pub clickhouse_enabled: bool,
     /// Whether to spawn a local ClickHouse instance automatically.
     pub spawn_clickhouse: bool,
+    /// Mint tracking
+    pub mint: Option<solana_pubkey::Pubkey>,
 }
 
 /// Parses command-line arguments and environment variables into a [`Config`].
@@ -520,16 +524,32 @@ pub struct Config {
 /// assert!(!config.clickhouse_enabled);
 /// ```
 pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
-    let first_arg = std::env::args().nth(1).expect("no first argument given");
-    let slot_range = if first_arg.contains(':') {
-        let (slot_a, slot_b) = first_arg
+    let mut args = std::env::args();
+    let _bin = args.next();
+
+    let first = args
+        .next()
+        .ok_or("usage: <epoch|start:end> or <mint> <epoch|start:end>")?;
+
+    let (maybe_mint, range_token) = match first.parse::<Pubkey>() {
+        Ok(mint) => {
+            let tok = args
+                .next()
+                .ok_or("missing <epoch|start:end> after <mint>")?;
+            (Some(mint), tok)
+        }
+        Err(_) => (None, first),
+    };
+
+    let slot_range: Range<u64> = if range_token.contains(':') {
+        let (slot_a, slot_b) = range_token
             .split_once(':')
-            .expect("failed to parse slot range, expected format: <start>:<end> or a single epoch");
-        let slot_a: u64 = slot_a.parse().expect("failed to parse first slot");
-        let slot_b: u64 = slot_b.parse().expect("failed to parse second slot");
+            .ok_or("failed to parse slot range, expected <start>:<end>")?;
+        let slot_a: u64 = slot_a.parse().map_err(|_| "failed to parse first slot")?;
+        let slot_b: u64 = slot_b.parse().map_err(|_| "failed to parse second slot")?;
         slot_a..(slot_b + 1)
     } else {
-        let epoch: u64 = first_arg.parse().expect("failed to parse epoch");
+        let epoch: u64 = range_token.parse().map_err(|_| "failed to parse epoch")?;
         log::info!("epoch: {}", epoch);
         let (start_slot, end_slot_inclusive) =
             jetstreamer_firehose::epochs::epoch_to_slot_range(epoch);
@@ -551,6 +571,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
         slot_range,
         clickhouse_enabled,
         spawn_clickhouse,
+        mint: maybe_mint,
     })
 }
 
