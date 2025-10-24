@@ -84,6 +84,8 @@
 //! | `JETSTREAMER_CLICKHOUSE_DSN` | `http://localhost:8123` | HTTP(S) DSN passed to the embedded plugin runner for ClickHouse writes. Override to target a remote ClickHouse deployment. |
 //! | `JETSTREAMER_CLICKHOUSE_MODE` | `auto` | Controls ClickHouse integration. `auto` enables output and spawns the helper only for local DSNs, `remote` enables output without spawning the helper, `local` always requests the helper, and `off` disables ClickHouse entirely. |
 //! | `JETSTREAMER_THREADS` | `1` | Number of firehose ingestion threads. Increase based on CPU headroom and downstream sink capacity. |
+//! | `JETSTREAMER_RPC_URL` | `https://api.mainnet-beta.solana.com` | Solana RPC endpoint used to fetch the current slot when using time duration format (e.g., `5m`, `1h`). |
+//! | `JETSTREAMER_BUFFER_DAYS` | `1` | Number of days to subtract from current slot to avoid slots too recent for Old Faithful. Applies when using time duration format. Set to `0` to disable. |
 //!
 //! Helper spawning only occurs when both the mode allows it (`auto`/`local`) **and** the DSN
 //! points to `localhost` or `127.0.0.1`.
@@ -120,6 +122,7 @@ use solana_pubkey::Pubkey;
 use core::ops::Range;
 use jetstreamer_firehose::{epochs::slot_to_epoch, index::get_index_base_url};
 use jetstreamer_plugin::{Plugin, PluginRunner, PluginRunnerError};
+use reqwest::Client;
 use std::sync::Arc;
 
 const WORKER_THREAD_MULTIPLIER: usize = 4; // each plugin thread gets 4 worker threads
@@ -504,12 +507,89 @@ pub struct Config {
     pub mint: Option<solana_pubkey::Pubkey>,
 }
 
+const SLOT_TIME_MS: u64 = 400; // Average time per slot in milliseconds
+const DEFAULT_BUFFER_DAYS: u64 = 1; // Default buffer in days to avoid slots too recent for Old Faithful
+
+/// Gets the current slot from Solana RPC.
+async fn get_current_slot() -> Result<u64, Box<dyn std::error::Error>> {
+    let client = Client::new();
+    let url = std::env::var("JETSTREAMER_RPC_URL")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    let request_body = r#"{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[]}"#;
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(request_body)
+        .send()
+        .await?;
+    let text = response.text().await?;
+    let slot_info: serde_json::Value = serde_json::from_str(&text)?;
+    let slot = slot_info["result"]
+        .as_u64()
+        .ok_or("Failed to parse current slot")?;
+    Ok(slot)
+}
+
+/// Parses a time duration string (e.g., "5m", "1d", "2h") into the number of slots.
+fn parse_time_duration_to_slots(duration_str: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let duration_str = duration_str.trim().to_lowercase();
+
+    if duration_str.is_empty() {
+        return Err("Empty duration string".into());
+    }
+
+    let (number_part, unit_part) = if let Some(pos) = duration_str.find(|c: char| c.is_alphabetic())
+    {
+        (&duration_str[..pos], &duration_str[pos..])
+    } else {
+        return Err("Duration must have a unit (s, m, h, d)".into());
+    };
+
+    let number: u64 = number_part
+        .parse()
+        .map_err(|_| "Invalid number in duration")?;
+
+    // Calculate slots based on unit
+    // 1 slot = 400ms
+    // 1 second = 1000ms / 400ms = 2.5 slots
+    // 1 minute = 60 seconds = 150 slots
+    // 1 hour = 60 minutes = 9,000 slots
+    // 1 day = 24 hours = 216,000 slots
+    let slots_per_unit = match unit_part {
+        "s" | "sec" | "second" | "seconds" => 1000 / SLOT_TIME_MS, // ~2.5 slots/second
+        "m" | "min" | "minute" | "minutes" => 60_000 / SLOT_TIME_MS, // ~150 slots/minute
+        "h" | "hr" | "hour" | "hours" => 3_600_000 / SLOT_TIME_MS, // ~9,000 slots/hour
+        "d" | "day" | "days" => 86_400_000 / SLOT_TIME_MS,         // ~216,000 slots/day
+        _ => return Err(format!("Unknown time unit: {}. Use s, m, h, or d", unit_part).into()),
+    };
+
+    Ok(number * slots_per_unit)
+}
+
 /// Parses command-line arguments and environment variables into a [`Config`].
 ///
 /// The following environment variables are inspected:
 /// - `JETSTREAMER_CLICKHOUSE_MODE`: Controls ClickHouse integration. Accepts `auto`, `remote`,
 ///   `local`, or `off`.
 /// - `JETSTREAMER_THREADS`: Number of firehose ingestion threads.
+/// - `JETSTREAMER_RPC_URL`: Solana RPC URL for fetching current slot (default: https://api.mainnet-beta.solana.com).
+/// - `JETSTREAMER_BUFFER_DAYS`: Number of days to subtract from current slot to avoid slots too recent
+///   for Old Faithful archive (default: 1 day). Set to 0 to disable buffer.
+///
+/// # CLI Argument Formats
+/// - `<epoch>` - Process a specific epoch (e.g., `800`)
+/// - `<start_slot>:<end_slot>` - Process a slot range (e.g., `358560000:367631999`)
+/// - `<duration>` - Process slots from duration ago to safe_end_slot (e.g., `5m`, `1h`, `2d`)
+/// - `<mint> <epoch|start:end|duration>` - Track specific mint with any of the above formats
+///
+/// Duration format examples:
+/// - `5m` - 5 minutes of slots (ending at current_slot - buffer)
+/// - `1h` - 1 hour of slots (ending at current_slot - buffer)
+/// - `2d` - 2 days of slots (ending at current_slot - buffer)
+/// - `30s` - 30 seconds of slots (ending at current_slot - buffer)
+///
+/// Note: When using duration format, a buffer (default 1 day) is automatically applied to avoid
+/// slots that are too recent and may not be available in the Old Faithful archive yet
 ///
 /// # Examples
 ///
@@ -529,27 +609,77 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
 
     let first = args
         .next()
-        .ok_or("usage: <epoch|start:end> or <mint> <epoch|start:end>")?;
+        .ok_or("usage: <epoch|start:end|duration> or <mint> <epoch|start:end|duration>")?;
 
     let (maybe_mint, range_token) = match first.parse::<Pubkey>() {
         Ok(mint) => {
             let tok = args
                 .next()
-                .ok_or("missing <epoch|start:end> after <mint>")?;
+                .ok_or("missing <epoch|start:end|duration> after <mint>")?;
             (Some(mint), tok)
         }
         Err(_) => (None, first),
     };
 
+    // Check if range_token is a time duration format (e.g., "5m", "1d")
+    let is_time_duration = range_token.chars().any(|c| c.is_alphabetic())
+        && !range_token.contains(':')
+        && range_token.chars().any(|c| c.is_numeric());
+
     let slot_range: Range<u64> = if range_token.contains(':') {
+        // Slot range format: start:end
         let (slot_a, slot_b) = range_token
             .split_once(':')
             .ok_or("failed to parse slot range, expected <start>:<end>")?;
         let slot_a: u64 = slot_a.parse().map_err(|_| "failed to parse first slot")?;
         let slot_b: u64 = slot_b.parse().map_err(|_| "failed to parse second slot")?;
         slot_a..(slot_b + 1)
+    } else if is_time_duration {
+        // Time duration format: 5m, 1h, 2d, etc.
+        log::info!("Parsing time duration: {}", range_token);
+
+        // Need to use tokio runtime to make async call
+        let runtime = tokio::runtime::Runtime::new()?;
+        let current_slot = runtime.block_on(get_current_slot())?;
+
+        // Get buffer from env or use default (1 day)
+        let buffer_days = std::env::var("JETSTREAMER_BUFFER_DAYS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_BUFFER_DAYS);
+
+        // Calculate buffer in slots (~216,000 slots per day)
+        let buffer_slots = buffer_days * (86_400_000 / SLOT_TIME_MS);
+
+        // Apply buffer to avoid slots too recent for Old Faithful
+        let safe_end_slot = current_slot.saturating_sub(buffer_slots);
+
+        let slots_back = parse_time_duration_to_slots(&range_token)?;
+        let start_slot = safe_end_slot.saturating_sub(slots_back);
+
+        log::info!(
+            "Current slot: {}, buffer: {}d ({} slots), safe end slot: {}",
+            current_slot,
+            buffer_days,
+            buffer_slots,
+            safe_end_slot
+        );
+        log::info!(
+            "Time duration {} = {} slots back from safe end slot",
+            range_token,
+            slots_back
+        );
+        log::info!("Processing slot range: {} to {}", start_slot, safe_end_slot);
+
+        start_slot..(safe_end_slot + 1)
     } else {
-        let epoch: u64 = range_token.parse().map_err(|_| "failed to parse epoch")?;
+        // Epoch format
+        let epoch: u64 = range_token.parse().map_err(|_| {
+            format!(
+                "failed to parse '{}' as epoch, slot range (start:end), or time duration (e.g., 5m, 1h, 2d)",
+                range_token
+            )
+        })?;
         log::info!("epoch: {}", epoch);
         let (start_slot, end_slot_inclusive) =
             jetstreamer_firehose::epochs::epoch_to_slot_range(epoch);

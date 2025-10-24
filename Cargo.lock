@@ -3229,6 +3229,8 @@ dependencies = [
  "jetstreamer-plugin",
  "jetstreamer-utils",
  "log",
+ "reqwest 0.12.23",
+ "serde_json",
  "solana-logger",
  "solana-pubkey 3.0.0",
  "tokio",
